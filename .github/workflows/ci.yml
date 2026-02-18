@@ -24,7 +24,6 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build Native Helper
+      - name: Build Helper App
         run: |
-          cd helper
-          swift build -c release
+          npm run build:helper-app

@@ -99,38 +99,78 @@ enum HelperError: Error {
 
 @main
 @MainActor
-struct XcodePreviewHelper {
+struct XcodePreviewMCPHelperAppMain {
     private static let axFrameAttribute: CFString = "AXFrame" as CFString
 
     static func main() async {
+        let rawArguments = sanitizedArguments()
+        let fallbackResponsePath = responsePathFromRawArguments(rawArguments)
+
         do {
             initializeAppKit()
-            let data = try await run()
-            if let text = String(data: data, encoding: .utf8) {
-                print(text)
-            } else {
-                throw HelperError.message("Unable to encode JSON output")
-            }
+            let invocation = try parseInvocation(rawArguments)
+            let data = try await run(command: invocation.command, options: invocation.options)
+            try writeResponse(data, responsePath: invocation.responsePath)
+            NSApp.terminate(nil)
+            exit(0)
         } catch {
             let payload = JSONError(error: errorMessage(error))
-            if let data = try? JSONEncoder().encode(payload),
-               let text = String(data: data, encoding: .utf8)
-            {
-                FileHandle.standardError.write(Data(text.utf8))
-                FileHandle.standardError.write(Data("\n".utf8))
+            let data = try? encodeJSON(payload)
+            if let data {
+                try? writeResponse(data, responsePath: fallbackResponsePath)
+            } else {
+                FileHandle.standardError.write(Data("{\"error\":\"Unable to encode JSON output\"}\n".utf8))
             }
+            NSApp.terminate(nil)
             exit(1)
         }
     }
 
-    static func run() async throws -> Data {
-        let commandLine = Array(CommandLine.arguments.dropFirst())
-        guard let command = commandLine.first else {
+    static func sanitizedArguments() -> [String] {
+        Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
+    }
+
+    static func responsePathFromRawArguments(_ rawArguments: [String]) -> String? {
+        var index = 0
+        while index < rawArguments.count {
+            if rawArguments[index] == "--response-path" {
+                let nextIndex = index + 1
+                if nextIndex < rawArguments.count, !rawArguments[nextIndex].hasPrefix("--") {
+                    return rawArguments[nextIndex]
+                }
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    static func parseInvocation(_ rawArguments: [String]) throws -> (command: String, options: [String: String], responsePath: String?) {
+        guard let command = rawArguments.first else {
             throw HelperError.message("Missing command. Use one of: permissions, list-windows, capture")
         }
+        var options = try parseOptions(Array(rawArguments.dropFirst()))
+        let responsePath = options.removeValue(forKey: "response-path")
+        return (command, options, responsePath)
+    }
 
-        let options = try parseOptions(Array(commandLine.dropFirst()))
+    static func writeResponse(_ data: Data, responsePath: String?) throws {
+        guard let responsePath, !responsePath.isEmpty else {
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw HelperError.message("Unable to encode JSON output")
+            }
+            print(text)
+            return
+        }
 
+        let responseURL = URL(fileURLWithPath: responsePath)
+        try FileManager.default.createDirectory(
+            at: responseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: responseURL, options: .atomic)
+    }
+
+    static func run(command: String, options: [String: String]) async throws -> Data {
         switch command {
         case "permissions":
             let promptScreen = boolOption(options, key: "prompt-screen", defaultValue: false)

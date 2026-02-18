@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -14,14 +15,21 @@ const thisFile = fileURLToPath(import.meta.url);
 const thisDir = path.dirname(thisFile);
 const LOG_COMPONENT = "xcode-preview-mcp";
 const HELPER_TIMEOUT_MS = 30_000;
+const HELPER_POLL_INTERVAL_MS = 100;
 const HELPER_MAX_BUFFER_BYTES = 20 * 1024 * 1024;
 
-const DEFAULT_HELPER_PATH = path.resolve(
+const DEFAULT_HELPER_APP_PATH = path.resolve(
   thisDir,
-  "../helper/.build/release/xcode-preview-helper",
+  "../XcodePreviewMCPHelperApp/build/Build/Products/Release/XcodePreviewMCPHelperApp.app",
 );
 
-const helperPath = process.env.XCODE_PREVIEW_HELPER_PATH ?? DEFAULT_HELPER_PATH;
+const helperAppPath = process.env.XCODE_PREVIEW_APP_PATH ?? DEFAULT_HELPER_APP_PATH;
+const helperExecutablePath = path.join(
+  helperAppPath,
+  "Contents",
+  "MacOS",
+  "XcodePreviewMCPHelperApp",
+);
 
 function log(
   level: "INFO" | "ERROR",
@@ -55,24 +63,6 @@ function toCliOptions(raw: Record<string, unknown>): string[] {
   return args;
 }
 
-function parseHelperStderr(stderr: string): string {
-  const trimmed = stderr.trim();
-  if (!trimmed) {
-    return "Helper returned no stderr";
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed) as { error?: unknown };
-    if (parsed && typeof parsed.error === "string" && parsed.error.trim()) {
-      return parsed.error.trim();
-    }
-  } catch {
-    // Non-JSON stderr is still useful as-is.
-  }
-
-  return trimmed;
-}
-
 function describeUnknownError(error: unknown): string {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -80,48 +70,118 @@ function describeUnknownError(error: unknown): string {
   return String(error);
 }
 
+function parseHelperErrorPayload(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const maybeError = (payload as { error?: unknown }).error;
+  if (typeof maybeError === "string" && maybeError.trim()) {
+    return maybeError.trim();
+  }
+  return null;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForHelperResponse(responsePath: string, command: string) {
+  const deadline = Date.now() + HELPER_TIMEOUT_MS;
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    try {
+      const raw = await readFile(responsePath, "utf8");
+      if (!raw.trim()) {
+        await sleep(HELPER_POLL_INTERVAL_MS);
+        continue;
+      }
+
+      const payload = JSON.parse(raw) as unknown;
+      const helperError = parseHelperErrorPayload(payload);
+      if (helperError) {
+        throw new Error(`Helper command '${command}' failed: ${helperError}`);
+      }
+
+      return payload;
+    } catch (error) {
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        (error as { code?: string }).code === "ENOENT"
+      ) {
+        // App has not written the response file yet.
+      } else if (error instanceof Error && error.message.startsWith("Helper command '")) {
+        throw error;
+      } else {
+        lastError = error;
+      }
+    }
+
+    await sleep(HELPER_POLL_INTERVAL_MS);
+  }
+
+  const suffix = lastError ? `: ${describeUnknownError(lastError)}` : "";
+  throw new Error(
+    `Helper command '${command}' timed out waiting for app response at ${responsePath}${suffix}`,
+  );
+}
+
 async function runHelper(command: string, options: Record<string, unknown>) {
-  const args = [command, ...toCliOptions(options)];
+  const tempDir = await mkdtemp(path.join(tmpdir(), "xcode-preview-mcp-helper-app-"));
+  const responsePath = path.join(tempDir, "response.json");
+  const args = [
+    "-n",
+    "-a",
+    helperAppPath,
+    "--args",
+    command,
+    ...toCliOptions(options),
+    "--response-path",
+    responsePath,
+  ];
 
   try {
-    const result = await execFileAsync(helperPath, args, {
+    await execFileAsync("open", args, {
       maxBuffer: HELPER_MAX_BUFFER_BYTES,
       timeout: HELPER_TIMEOUT_MS,
     });
-
-    const stdout = result.stdout.trim();
-    if (!stdout) {
-      throw new Error(`Helper command '${command}' returned no stdout`);
-    }
-
-    try {
-      return JSON.parse(stdout) as unknown;
-    } catch (error) {
-      throw new Error(
-        `Helper command '${command}' returned invalid JSON: ${describeUnknownError(error)}`,
-      );
-    }
+    return await waitForHelperResponse(responsePath, command);
   } catch (error) {
+    const errorMessage =
+      error && typeof error === "object" && "message" in error
+        ? String((error as { message?: unknown }).message ?? "")
+        : typeof error === "string"
+          ? error
+          : "";
+    if (errorMessage.startsWith(`Helper command '${command}'`)) {
+      throw new Error(errorMessage);
+    }
+
     if (error && typeof error === "object" && "stderr" in error) {
       const stderr = String((error as { stderr?: string }).stderr ?? "");
       const timeoutSuffix = "killed" in error && error.killed ? " (timed out)" : "";
       if (stderr) {
-        throw new Error(
-          `Helper command '${command}' failed${timeoutSuffix}: ${parseHelperStderr(stderr)}`,
-        );
+        throw new Error(`Failed to launch helper app${timeoutSuffix}: ${stderr.trim()}`);
       }
     }
 
-    throw new Error(`Helper command '${command}' failed: ${describeUnknownError(error)}`);
+    throw new Error(
+      `Helper command '${command}' failed while launching helper app: ${describeUnknownError(error)}`,
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
   }
 }
 
 async function ensureHelperExists() {
   try {
-    await access(helperPath, fsConstants.R_OK | fsConstants.X_OK);
+    await access(helperExecutablePath, fsConstants.R_OK | fsConstants.X_OK);
   } catch {
     throw new Error(
-      `Missing helper binary at ${helperPath}. Build it first: cd tools/xcode-preview-mcp && npm run build:helper`,
+      `Missing helper app executable at ${helperExecutablePath}. Build it first: cd tools/xcode-preview-mcp && npm run build:helper-app`,
     );
   }
 }
@@ -249,7 +309,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  log("INFO", "server started", { helperPath });
+  log("INFO", "server started", { helperAppPath, helperExecutablePath });
 }
 
 main().catch((error) => {

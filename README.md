@@ -23,7 +23,7 @@ Call `xcode_preview_permissions` with prompts enabled once:
 - `promptScreen: true`
 - `promptAccessibility: true`
 
-After you approve both, capture works.
+After you approve both for `XcodePreviewMCPHelperApp`, capture works.
 
 ## MCP config
 
@@ -34,7 +34,7 @@ After you approve both, capture works.
       "command": "node",
       "args": ["/Users/andrewfinke/projects/Attractions Collection/tools/xcode-preview-mcp/dist/index.js"],
       "env": {
-        "XCODE_PREVIEW_HELPER_PATH": "/Users/andrewfinke/projects/Attractions Collection/tools/xcode-preview-mcp/helper/.build/release/xcode-preview-helper"
+        "XCODE_PREVIEW_APP_PATH": "/Users/andrewfinke/projects/Attractions Collection/tools/xcode-preview-mcp/XcodePreviewMCPHelperApp/build/Build/Products/Release/XcodePreviewMCPHelperApp.app"
       }
     }
   }
